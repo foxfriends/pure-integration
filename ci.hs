@@ -1,4 +1,5 @@
 {-# LANGUAGE Arrows #-}
+{-# LANGUAGE LambdaCase #-}
 
 import Control.Arrow
 import Control.Concurrent
@@ -8,68 +9,75 @@ import Data.Map (Map)
 import qualified Data.Map as Map
 import System.Random
 
-data WorkflowContext = WorkflowContext
+data Env = Env
   { env :: Map String String,
     cwd :: String
   }
 
-data WorkflowResult t
-  = Success t
-  | Failure String
+type WorkflowResult = Either String
 
-type Stage = StateT WorkflowContext IO
+type Context = StateT Env IO
 
-type Workflow t = Kleisli Stage (MVar t) (MVar t)
+type Pipeline f t = Kleisli Context f t
 
-stage :: IO t -> Workflow t
+type Stage f t = Pipeline (MVar f) (MVar t)
+
+type Workflow = Stage (WorkflowResult ()) (WorkflowResult ())
+
+stage :: (f -> IO t) -> Stage f t
 stage task = proc input -> do
   output <- Kleisli (const $ liftIO newEmptyMVar) -< ()
   _thread <- Kleisli (liftIO . forkIO . inner) -< (input, output)
   returnA -< output
   where
     inner (input, output) = do
-      readMVar input
-      result <- task
+      status <- readMVar input
+      result <- task status
       putMVar output result
 
-checkout :: Workflow (WorkflowResult ())
-checkout = stage $ do
+checkout :: Stage (WorkflowResult ()) (WorkflowResult ())
+checkout = stage $ \_ -> do
   putStrLn "git checkout"
   delay <- randomRIO (1000000, 2000000)
   threadDelay delay
-  return $ Success ()
+  return $ Right ()
 
-node :: String -> Workflow (WorkflowResult ())
-node cmd = stage $ do
+node :: String -> Stage (WorkflowResult ()) (WorkflowResult ())
+node cmd = stage $ \_ -> do
   putStrLn cmd
   delay <- randomRIO (1000000, 2000000)
   threadDelay delay
-  return $ Success ()
+  return $ Right ()
 
 main :: IO ()
 main = do
-  start <- newMVar (Success ())
-  end <- evalStateT (runKleisli workflow start) (WorkflowContext {env = Map.empty, cwd = "/workspace"})
+  start <- newMVar (Right ())
+  end <- evalStateT (runKleisli workflow start) (Env {env = Map.empty, cwd = "/workspace"})
   result <- takeMVar end
   case result of
-    Success _ -> return ()
-    Failure msg -> error msg
+    Right _ -> return ()
+    Left msg -> error msg
 
-merge :: Kleisli Stage [MVar (WorkflowResult a)] (MVar (WorkflowResult ()))
+merge :: Pipeline [MVar (WorkflowResult a)] (MVar (WorkflowResult [a]))
 merge =
   Kleisli
     ( \mvs -> liftIO $ do
         statuses <- mapM readMVar mvs
-        newMVar $ all_ statuses
+        newMVar $ all statuses
     )
   where
-    all_ [] = Success ()
-    all_ ((Success _) : ss) = all_ ss
-    all_ ((Failure msg) : _) = Failure msg
+    all [] = Right []
+    all ((Right s) : ss) = (s :) <$> all ss
+    all ((Left msg) : _) = Left msg
+
+end :: Stage (WorkflowResult a) (WorkflowResult ())
+end = stage $ \case
+  Right _ -> return $ Right ()
+  Left msg -> return $ Left msg
 
 -- Workflow File:
 
-workflow :: Workflow (WorkflowResult ())
+workflow :: Workflow
 workflow = proc start -> do
   a <- checkout -< start
   b <- node "npm ci" -< a
@@ -78,4 +86,5 @@ workflow = proc start -> do
   e <- node "npm run fmt" -< b
   f <- node "npm run migrate" -< c
   g <- node "npm test" -< f
-  merge -< [d, e, g]
+  deg <- merge -< [d, e, g]
+  end -< deg
